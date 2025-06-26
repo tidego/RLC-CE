@@ -1,6 +1,6 @@
 """
 
-Training province Carbon Emission Efficiency (CE) model
+Forecasting province Carbon Emission Efficiency (CE)
 
 """
 
@@ -260,16 +260,20 @@ class MaskablePolicyImpactEnv(PolicyImpactEnv):
         legal = [(c == self.province and y <= self.year) for c, y in self.action_pairs]
         mask[np.where(legal)] = 1
         return mask
+
 # ============== Build the Training Environment ============== #
 def build_wrapped_env(df, diff_dict, xgb_model):
     mask_fn = lambda e: e.get_action_mask()
     base_env = MaskablePolicyImpactEnv(df, diff_dict, xgb_model)
     return ActionMasker(RewardScalerWrapper(base_env), mask_fn)
-
 # ============== Train PPO ============== #
 def train_ppo(df, diff_dict, xgb_model) -> MaskablePPO:
     """Builds a vectorized environment, trains MaskablePPO, and saves the model"""
 
+    def mask_fn(env):  # For use with ActionMasker
+        return env.get_action_mask()
+
+    # Training environment
     vec_env = make_vec_env(
         lambda: build_wrapped_env(df, diff_dict, xgb_model),
         n_envs=1,
@@ -293,29 +297,97 @@ def train_ppo(df, diff_dict, xgb_model) -> MaskablePPO:
         device="cpu"
     )
 
+    # Evaluation environment
+    eval_env = make_vec_env(
+        lambda: RewardScalerWrapper(PolicyImpactEnv(df, diff_dict, xgb_model)),
+        n_envs=1,
+        seed=SEED + 1
+    )
+    eval_cb = EvalCallback(
+        eval_env,
+        best_model_save_path=BEST_PPO_DIR,
+        eval_freq=10_000,
+        deterministic=True,
+        render=False,
+        verbose=0
+    )
+
+    # Start training
     model.learn(
-        total_timesteps=50_000,
-        callback=AdaptiveEntropyCallback()
+        total_timesteps=50_000,  # Increase if longer training is needed
+        callback=[AdaptiveEntropyCallback(), eval_cb]
     )
 
     model.save(PPO_FILE)
     print("PPO model saved to:", PPO_FILE)
     return model
 
+# ============== Forecast CE for the Next 5 Years ============== #
+def forecast(df, diff_dict, ppo, xgb):
+    """
+    Use trained MaskablePPO + XGB to forecast CE for 2023–2027.
+    - Start from 2022 indicators for each province
+    - For each year: apply optimal action → update features → predict next year's CE using XGB
+    - If real value exists, compute abs_error (optional)
+    """
+    env_unwrapped = ppo.get_env().envs[0].unwrapped
+    rec = []
+
+    for province in sorted(df["省份"].unique()):
+        feats = df.query("省份==@province and 年份==2022").iloc[0][FEATURES].values.astype(np.float32)
+        year = 2022
+
+        for _ in range(PRED_YEARS):
+            state = np.concatenate([feats, [(year - 2013) / 9]]).reshape(1, -1)
+
+            # Update env's internal state for masking
+            env_unwrapped.province = province
+            env_unwrapped.year = year
+            mask = env_unwrapped.get_action_mask()
+
+            # Predict a valid action
+            action, _ = ppo.predict(state, deterministic=True, action_masks=mask)
+            province_a, year_a = env_unwrapped.action_pairs[int(action)]
+
+            # Apply feature change
+            diff = diff_dict[(province_a, year_a)]
+            feats = feats + feats * diff / 100.0
+            pred_ce = xgb.predict(feats.reshape(1, -1))[0]
+
+
+            rec.append({
+                "province": province,
+                "year": year + 1,
+                "pred_CE": pred_ce,
+                "action_from": f"{province_a}-{year_a}",
+            })
+            year += 1
+
+    out = pd.DataFrame(rec)
+    out.to_excel("future_5yr_ce.xlsx", index=False)
+    print("Forecast results for the next 5 years saved to future_5yr_ce.xlsx")
+    return out
+
+
 # ============== Main Entry Point ============== #
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--skip_xgb", action="store_true", help="Skip XGB training if model exists")
+    parser.add_argument("--infer", action="store_true", help="Inference only: skip training")
     args = parser.parse_args()
 
     df = load_data()
     diff_dict = build_diff(df)
-    # xgb = get_xgb(df, skip_train=args.skip_xgb)
-    
-    xgb = get_xgb(df, skip_train=True)
+    xgb = get_xgb(df, skip_train=args.infer)
 
+    # Train or load PPO
+    if args.infer and os.path.exists(PPO_FILE):
+        print("Loading PPO model ...")
+        env = build_wrapped_env(df, diff_dict, xgb)
+        ppo = MaskablePPO.load(PPO_FILE, env=env, device="cpu")
+    else:
+        ppo = train_ppo(df, diff_dict, xgb)
 
-    train_ppo(df, diff_dict, xgb)
+    forecast(df, diff_dict, ppo, xgb)
 
 
 if __name__ == "__main__":
